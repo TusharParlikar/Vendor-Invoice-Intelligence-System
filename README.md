@@ -1,4 +1,4 @@
-# Vendor-Invoice-Intelligence-System
+
 # Vendor Invoice Intelligence System
 
 End-to-end machine learning system for vendor invoice cost forecasting and audit-risk triage. Built as a production-style project: SQL data layer → modular Python pipeline → saved model artifacts → inference layer → Streamlit web application.
