@@ -304,7 +304,3 @@ http://localhost:8501
 `Python` · `SQL` · `SQLite` · `Pandas` · `NumPy` · `Scikit-learn` · `SciPy` · `Matplotlib` · `Seaborn` · `Joblib` · `Streamlit`
 
 ---
-
-
-
-Email: `your.email@example.com`
