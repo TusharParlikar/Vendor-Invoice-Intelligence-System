@@ -1,94 +1,76 @@
-
 # Vendor Invoice Intelligence System
 
-End-to-end machine learning system for vendor invoice cost forecasting and audit-risk triage. Built as a production-style project: SQL data layer → modular Python pipeline → saved model artifacts → inference layer → Streamlit web application.
+An end-to-end machine learning project for predicting vendor freight costs and identifying invoices that may need manual review.
 
-**Two prediction modules:**
+The project has two parts:
 
-| Module | Type | Output |
-|---|---|---|
-| Freight Cost Prediction | Regression | Expected freight cost for an invoice |
-| Invoice Risk Flagging | Binary Classification | Auto-approve vs. route for manual review |
-
----
-
-## Table of Contents
-
-- [Business Problem](#business-problem)
-- [System Architecture](#system-architecture)
-- [Data Source](#data-source)
-- [Feature Engineering](#feature-engineering)
-- [Modeling & Results](#modeling--results)
-- [Application](#application)
-- [Project Structure](#project-structure)
-- [How to Run](#how-to-run)
-- [Known Limitations](#known-limitations)
-- [Tech Stack](#tech-stack)
-- [Author](#author)
+| Module                  | Type           | What it does                       |
+| ----------------------- | -------------- | ---------------------------------- |
+| Freight Cost Prediction | Regression     | Predicts the expected freight cost |
+| Invoice Risk Flagging   | Classification | Flags invoices for manual review   |
 
 ---
 
 ## Business Problem
 
-**Invoice cost leakage and audit risk management.**
+When companies receive a large number of vendor invoices, checking everything manually can take a lot of time.
 
-Finance teams reviewing vendor invoices face two recurring problems:
+Two common problems are:
 
-1. **Freight cost is unpredictable.** Freight is a non-trivial component of landed cost. Without an expected value, teams cannot budget accurately, estimate margin, or negotiate rates with vendors from a position of data.
+* Freight costs can vary depending on the invoice value and quantity.
+* Some invoices may have mismatched amounts or unusual delays and need extra checking.
 
-2. **Manual invoice review does not scale.** Reviewing every invoice by hand is slow and gets slower as transaction volume grows. Abnormal freight charges, price deviations, and delivery delays usually indicate data-entry errors, disputes, or compliance risk — but they are buried among invoices that are perfectly fine.
+I built this project to handle both problems using machine learning.
 
-This system addresses both: it predicts expected freight cost per invoice, and it flags only the invoices that actually need a human. Low-risk invoices are cleared for auto-approval, so reviewer attention concentrates where it adds value.
+The first model predicts the expected freight cost, while the second model identifies invoices that may need manual approval.
 
 ---
 
 ## System Architecture
 
-```
-SQLite (inventory.db)
-        │
-        ▼
-  SQL aggregation + joins  ──►  Feature engineering
-        │
-        ▼
-  EDA · correlation analysis · Welch's t-test feature screening
-        │
-        ├──────────────────────────────┐
-        ▼                              ▼
-  Regression pipeline           Classification pipeline
-  (freight cost)                (invoice risk)
-        │                              │
-        ▼                              ▼
-  Model comparison             Model comparison + GridSearchCV
-        │                              │
-        ▼                              ▼
-  predict_freight_model.pkl     predict_flag_invoice.pkl + scaler.pkl
-        │                              │
-        └──────────────┬───────────────┘
-                       ▼
-              Inference layer (inference/)
-                       │
-                       ▼
-              Streamlit portal (app.py)
+```text
+SQLite Database
+      ↓
+SQL Queries + Data Processing
+      ↓
+Feature Engineering
+      ↓
+Model Training
+      ↓
+Saved Models
+      ↓
+Inference
+      ↓
+Streamlit App
 ```
 
-Training is script-driven, not notebook-driven. Notebooks are exploratory only; every step that survived exploration was rewritten as a function and chained into `train.py`, so the pipeline can be re-run on a schedule for retraining.
+The training code is separated from the Streamlit application.
+
+The notebooks were mainly used for exploration and testing. The final preprocessing, training, and evaluation steps were moved into Python scripts so the models can be trained again when needed.
 
 ---
 
-## Data Source
+## Data
 
-Relational SQLite database (`data/inventory.db`) with the following tables:
+The project uses a SQLite database:
 
-| Table | Contents |
-|---|---|
-| `purchases` | Line-item purchase records — inventory ID, brand, vendor, PO number, PO date, receiving date, invoice date, purchase price, quantity, dollars |
-| `purchase_prices` | Per-item purchase pricing by vendor |
-| `vendor_invoice` | Vendor-generated invoice per PO — quantity, dollars, freight, invoice date, pay date, approval status |
-| `begin_inventory` | Inventory position at start of period |
-| `end_inventory` | Inventory position at end of period |
+```text
+data/inventory.db
+```
 
-The two modeling tables are `vendor_invoice` (what the vendor billed) and `purchases` (what was actually ordered and received). The gap between them is the core signal for risk flagging.
+Main tables used:
+
+| Table             | Description                        |
+| ----------------- | ---------------------------------- |
+| `purchases`       | Purchase and receiving information |
+| `purchase_prices` | Purchase prices by vendor          |
+| `vendor_invoice`  | Vendor invoice information         |
+| `begin_inventory` | Beginning inventory                |
+| `end_inventory`   | Ending inventory                   |
+
+For invoice risk prediction, I mainly used `purchases` and `vendor_invoice`.
+
+The purchase data represents what the company ordered, while the invoice data represents what the vendor billed.
 
 ---
 
@@ -96,119 +78,155 @@ The two modeling tables are `vendor_invoice` (what the vendor billed) and `purch
 
 ### Freight Cost Prediction
 
-Direct features from `vendor_invoice`:
+I initially looked at:
 
-- `Quantity` — units on the invoice
-- `Dollars` — invoice amount
+* `Quantity`
+* `Dollars`
 
-Correlation with freight: quantity ≈ 0.94, dollars ≈ 0.96. The two predictors are themselves highly collinear (≈ 0.99), so the final model uses `Dollars` alone with no measurable loss in fit.
+Both had a strong correlation with freight cost.
 
-**Supporting analysis:** a derived `freight_per_unit` column split at the 25th and 75th quantiles of quantity shows bulk buyers pay materially less per unit in freight — roughly **$0.04/unit at high volume vs. $0.09/unit at low volume**. Outliers were retained; high-quantity vendors sit on the same regression line and represent real bulk behaviour, not data errors.
+However, `Quantity` and `Dollars` were also highly correlated with each other, so I used **`Dollars`** as the main feature for the final model.
+
+I also looked at freight cost per unit and found that larger purchases generally had a lower freight cost per unit.
+
+---
 
 ### Invoice Risk Flagging
 
-Built by aggregating `purchases` to PO level and left-joining `vendor_invoice` on `PONumber`.
+Purchase data was grouped by `PONumber` and then joined with the vendor invoice data.
 
-| Feature | Source | Meaning |
-|---|---|---|
-| `total_item_quantity` | `SUM(purchases.Quantity)` | Units actually ordered |
-| `total_item_dollars` | `SUM(purchases.Dollars)` | Order value on the company side |
-| `invoice_quantity` | `vendor_invoice.Quantity` | Units the vendor billed for |
-| `invoice_dollars` | `vendor_invoice.Dollars` | Amount the vendor billed |
-| `freight` | `vendor_invoice.Freight` | Freight charged |
+The main features were:
 
-**Target label** (`flag_invoice`): an invoice is flagged when the invoice-level total does not reconcile against the item-level total, or when the average receiving delay for that PO exceeds 10 days.
+* `total_item_quantity`
+* `total_item_dollars`
+* `invoice_quantity`
+* `invoice_dollars`
+* `freight`
 
-Class balance: 3,693 normal / 1,850 flagged — imbalanced but not severely.
+An invoice was marked as risky when the invoice did not match the purchase information or when the receiving delay was more than 10 days.
 
-**Feature screening.** Two passes removed noise:
+The dataset contained:
 
-1. **Welch's t-test** (`ttest_ind`, `equal_var=False`) comparing flagged vs. normal group means for every candidate metric. `days_to_pay` (35.42 vs. 35.49) and `total_brands` (42 vs. 40) returned p > 0.05 and were dropped as non-discriminative.
-2. **Random Forest feature importance** ranked `total_brands` and `days_po_to_invoice` lowest; removing them lifted F1 by roughly one point.
+* **3,693 normal invoices**
+* **1,850 flagged invoices**
 
-`avg_receiving_delay` was excluded from the feature set deliberately — it feeds the labelling rule and is not reliably known at invoice-arrival time.
+I also used statistical testing and Random Forest feature importance to remove features that were not useful.
 
 ---
 
-## Modeling & Results
+## Model Results
 
-### Regression — Freight Cost
+### Freight Cost Prediction
 
-Three candidates compared on an 80/20 split (`random_state=42`):
+I compared three models:
 
-| Model | R² |
-|---|---|
+| Model                 |       R² |
+| --------------------- | -------: |
 | **Linear Regression** | **0.97** |
-| Random Forest Regressor | 0.963 |
-| Decision Tree Regressor | 0.937 |
+| Random Forest         |    0.963 |
+| Decision Tree         |    0.937 |
 
-Linear Regression also produced the lowest MAE and RMSE. Depth tuning on the tree models (`max_depth` 2 → 5) never closed the gap: the relationship between invoice value and freight is close to linear, so the simplest model wins. **Selected: Linear Regression.**
+Linear Regression performed the best, so I selected it for the final model.
 
-Metrics: MAE, RMSE, R².
+The model was evaluated using:
 
-### Classification — Invoice Risk
-
-| Model | Accuracy |
-|---|---|
-| Logistic Regression | ~0.66 |
-| Decision Tree Classifier | ~0.81 |
-| Random Forest Classifier | ~0.87 |
-| **Random Forest + GridSearchCV** | **0.89** |
-
-Scaling was tested both ways — `StandardScaler` and `MinMaxScaler` produced effectively identical results; StandardScaler was kept.
-
-**Hyperparameter tuning:** `GridSearchCV`, 5-fold, scored on **F1** (precision/recall balance matters more than raw accuracy given the class imbalance). 216 candidate configurations.
-
-Best parameters: `n_estimators=300`, `criterion='gini'`, `max_depth=None`, `min_samples_split=5`, `min_samples_leaf=1`.
-
-**Confusion matrix improvement:** false positives on normal invoices dropped from **20/725 to 12/725** after tuning — a direct reduction in unnecessary manual review.
-
-Metrics: Accuracy, Precision, Recall, F1, Confusion Matrix.
+* MAE
+* RMSE
+* R²
 
 ---
 
-## Application
+### Invoice Risk Flagging
 
-`app.py` — a Streamlit portal, **Vendor Invoice Intelligence Portal**, with a sidebar radio selector that switches between the two modules.
+I compared:
 
-**Freight Cost Prediction** — numeric input form → returns predicted freight cost as a metric card.
+| Model                   |  Accuracy |
+| ----------------------- | --------: |
+| Logistic Regression     |     ~0.66 |
+| Decision Tree           |     ~0.81 |
+| Random Forest           |     ~0.87 |
+| **Tuned Random Forest** | **~0.89** |
 
-**Invoice Risk Flagging** — five-field numeric input form → returns either `Invoice requires manual approval` or `Invoice is safe for auto-approval`.
+For the Random Forest, I used `GridSearchCV` with 5-fold cross-validation and optimized for F1 score.
 
-Both modules call the `inference/` layer, which loads the saved `.pkl` artifacts. The app contains no training code and no model logic of its own.
+The final model used:
 
-> Add screenshots to `images/` and link them here — recruiters spend very little time on a repo, and a screenshot does more than a paragraph.
+```text
+n_estimators = 300
+criterion = gini
+max_depth = None
+min_samples_split = 5
+min_samples_leaf = 1
+```
+
+After tuning, false positives on normal invoices decreased from **20 to 12 out of 725**.
+
+---
+
+## Streamlit Application
+
+The project includes a simple Streamlit application called:
+
+**Vendor Invoice Intelligence Portal**
+
+It has two options.
+
+### Freight Cost Prediction
+
+Enter the invoice information and the application predicts the expected freight cost.
+
+### Invoice Risk Flagging
+
+Enter the invoice details and the application returns:
+
+```text
+Invoice requires manual approval
+```
+
+or
+
+```text
+Invoice is safe for auto-approval
+```
+
+The application loads the saved models through the `inference/` folder. Training is not performed inside the application.
 
 ---
 
 ## Project Structure
 
-```
+```text
 vendor-invoice-intelligence/
+│
 ├── data/
 │   └── inventory.db
+│
 ├── notebooks/
 │   ├── predicting_freight_cost.ipynb
 │   └── invoice_flagging.ipynb
+│
 ├── freight_cost_prediction/
 │   ├── data_preprocessing.py
 │   ├── modeling_evaluation.py
 │   └── train.py
+│
 ├── invoice_flagging/
 │   ├── data_preprocessing.py
 │   ├── modeling_evaluation.py
 │   └── train.py
+│
 ├── inference/
 │   ├── predict_freight.py
 │   └── predict_invoice_flag.py
+│
 ├── models/
 │   ├── predict_freight_model.pkl
 │   ├── predict_flag_invoice.pkl
 │   └── scaler.pkl
+│
 ├── images/
 ├── app.py
 ├── requirements.txt
-├── .gitignore
 └── README.md
 ```
 
@@ -216,68 +234,77 @@ vendor-invoice-intelligence/
 
 ## How to Run
 
-**1. Clone and install**
+### 1. Clone the project
 
 ```bash
 git clone https://github.com/<your-username>/vendor-invoice-intelligence.git
 cd vendor-invoice-intelligence
+```
+
+### 2. Create environment
+
+```bash
 python -m venv venv
-source venv/bin/activate      # Windows: venv\Scripts\activate
+```
+
+Windows:
+
+```bash
+venv\Scripts\activate
+```
+
+### 3. Install requirements
+
+```bash
 pip install -r requirements.txt
 ```
 
-**2. Place the database**
+### 4. Add database
 
-Put `inventory.db` in `data/`.
+Put `inventory.db` inside:
 
-**3. Train both models**
+```text
+data/
+```
+
+### 5. Train the models
 
 ```bash
 python freight_cost_prediction/train.py
 python invoice_flagging/train.py
 ```
 
-Artifacts are written to `models/`.
-
-**4. Verify inference**
-
-```bash
-python inference/predict_freight.py
-python inference/predict_invoice_flag.py
-```
-
-**5. Launch the app**
+### 6. Run the application
 
 ```bash
 streamlit run app.py
 ```
 
-Opens at `http://localhost:8501`.
+The application will open at:
+
+```text
+http://localhost:8501
+```
 
 ---
 
-## Known Limitations
+## Limitations
 
-Stated openly, because these are the first things a reviewer will probe:
-
-- **Label leakage.** The risk label is rule-derived, and one of its rules (invoice total vs. item total mismatch) uses the same columns that appear as model features. The classifier is therefore partly re-learning a rule it could execute directly. This is acceptable as a bootstrapping step to get a supervised dataset off the ground, but the honest next step is labels from actual reviewer decisions, or unsupervised clustering to discover risk groups rather than assert them.
-- **No logging.** Pipeline steps are not instrumented. Adding Python `logging` to each stage is the obvious next improvement for tracking which step ran and where a run failed.
-- **Basic deployment.** Models are saved locally as pickles and consumed directly by Streamlit. A FastAPI service in front of the artifacts, containerisation, and cloud hosting would be the production path.
-- **No drift monitoring.** Retraining is manual (re-run `train.py`). There is no automated check on whether model performance degrades over time.
-- **Single data snapshot.** Trained on one historical extract with no temporal validation split, so performance on genuinely future invoices is untested.
+* The invoice-risk labels are generated using predefined rules, so there is some label leakage.
+* The models were trained on one historical dataset.
+* No temporal validation was performed.
+* There is currently no model-drift monitoring.
+* Models are stored locally using `joblib`.
+* Logging and automated retraining can be added later.
 
 ---
 
 ## Tech Stack
 
-`Python` · `SQLite` · `SQL` · `pandas` · `NumPy` · `scikit-learn` · `SciPy` · `Matplotlib` · `Seaborn` · `joblib` · `Streamlit`
+`Python` · `SQL` · `SQLite` · `Pandas` · `NumPy` · `Scikit-learn` · `SciPy` · `Matplotlib` · `Seaborn` · `Joblib` · `Streamlit`
 
 ---
 
-## Author
 
-**<Your Name>**
 
-- GitHub: [@your-username](https://github.com/your-username)
-- LinkedIn: [your-linkedin](https://linkedin.com/in/your-linkedin)
-- Email: your.email@example.com
+Email: `your.email@example.com`
